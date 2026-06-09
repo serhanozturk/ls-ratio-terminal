@@ -926,7 +926,7 @@ document.getElementById('clockTR').textContent =
 }
 setInterval(tick, 1000); tick();
 
-setInterval(() => { if (!document.hidden && lastFetch) run(); }, 60000);
+setInterval(() => { if (!document.hidden && lastFetch) run(); }, 300000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden && lastFetch) run(); });
 
 run();
