@@ -837,9 +837,42 @@ lp.innerHTML = datasets.map(d =>
 ).join('');
 }
 
+// Ozel tooltip konumu: sol-ust kosede sabit (veride hareket genelde sagda olur, sol-ust bos)
+// Crosshair dikey cizgisi zaten X noktasini gosterir, tooltip kenarda durur -> nokta kapanmaz
+if (window.Chart && Chart.Tooltip && Chart.Tooltip.positioners) {
+Chart.Tooltip.positioners.topCenter = function(elements, eventPosition) {
+const chart = this.chart;
+return { x: chart.chartArea.left + 6, y: chart.chartArea.top + 6 };
+};
+}
+
+// Dikey crosshair cizgisi (dokunulan X noktasini gosterir)
+const crosshairPlugin = {
+id: 'crosshair',
+afterDraw(chart) {
+const tt = chart.tooltip;
+if (tt && tt._active && tt._active.length) {
+const ctx = chart.ctx;
+const x = tt._active[0].element.x;
+const top = chart.chartArea.top;
+const bottom = chart.chartArea.bottom;
+ctx.save();
+ctx.beginPath();
+ctx.moveTo(x, top);
+ctx.lineTo(x, bottom);
+ctx.lineWidth = 1;
+ctx.strokeStyle = 'rgba(109,245,212,0.5)';
+ctx.setLineDash([4, 4]);
+ctx.stroke();
+ctx.restore();
+}
+}
+};
+
 function makeChart(ctx, datasets, cutoff, now, period) {
 return new Chart(ctx, {
 type: 'line', data: { datasets },
+plugins: [crosshairPlugin],
 options: {
 responsive: true, maintainAspectRatio: false,
 interaction: { mode: 'index', intersect: false },
@@ -849,7 +882,10 @@ tooltip: {
 backgroundColor: '#0a0e0d', borderColor: '#2a3a37', borderWidth: 1,
 titleColor: '#d4dcd9', bodyColor: '#d4dcd9',
 titleFont: { family: 'JetBrains Mono', size: 11 }, bodyFont: { family: 'JetBrains Mono', size: 11 },
-padding: 10, callbacks: { label: (c) => `${c.dataset.label}: ${c.parsed.y.toFixed(2)}%` }
+padding: 10, caretPadding: 12,
+// Tooltip'i SABIT konuma tasi (noktayi kapatmasin) - hep ust ortada
+position: 'topCenter',
+callbacks: { label: (c) => `${c.dataset.label}: ${c.parsed.y.toFixed(2)}%` }
 }
 },
 scales: {
