@@ -885,14 +885,34 @@ titleFont: { family: 'JetBrains Mono', size: 11 }, bodyFont: { family: 'JetBrain
 padding: 10, caretPadding: 12,
 // Tooltip'i SABIT konuma tasi (noktayi kapatmasin) - hep ust ortada
 position: 'topCenter',
-callbacks: { label: (c) => `${c.dataset.label}: ${c.parsed.y.toFixed(2)}%` }
+callbacks: {
+title: (items) => {
+// Tooltip basligi TR saati (timestamp + 3 saat)
+if (!items.length) return '';
+const tr = new Date(items[0].parsed.x + 3*3600*1000);
+const z = n => String(n).padStart(2,'0');
+return `${z(tr.getUTCDate())}.${z(tr.getUTCMonth()+1)} ${z(tr.getUTCHours())}:${z(tr.getUTCMinutes())} TR`;
+},
+label: (c) => `${c.dataset.label}: ${c.parsed.y.toFixed(2)}%`
+}
 }
 },
 scales: {
 x: { type: 'time', min: cutoff, max: now,
+// Chart.js zaman islemlerini UTC'de yap (tick'ler UTC'de yuvarlanir),
+// sonra callback'te +3 ile temiz TR gosterilir (cift kaydirma olmaz)
+adapters: { date: { zone: 'UTC' } },
 time: { displayFormats: { minute:'HH:mm', hour:'MM/dd HH:mm', day:'MM/dd' } },
 grid: { color:'#14201d', drawTicks:false },
-ticks: { color:'#6e7976', font:{ family:'JetBrains Mono', size:10 }, maxTicksLimit: 6 },
+ticks: { color:'#6e7976', font:{ family:'JetBrains Mono', size:10 }, maxTicksLimit: 6,
+// Eksen etiketleri TR saati (timestamp + 3 saat). Tarayici diliminden bagimsiz.
+callback: function(value) {
+const tr = new Date(value + 3*3600*1000);
+const z = n => String(n).padStart(2,'0');
+return `${z(tr.getUTCMonth()+1)}/${z(tr.getUTCDate())} ${z(tr.getUTCHours())}:${z(tr.getUTCMinutes())}`;
+} },
+title: { display: true, text: 'TR (UTC+3)', color:'#3f4845',
+font:{ family:'JetBrains Mono', size:9 }, padding:{top:4} },
 border: { color:'#1f2a28' } },
 y: { min:0, max:100,
 grid: { color:'#14201d', drawTicks:false },
