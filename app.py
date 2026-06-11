@@ -1,15 +1,16 @@
 """
-L/S RATIO TERMINAL - Cloud-Ready Server (v3)
+L/S RATIO TERMINAL - Cloud-Ready Server (v4)
 =============================================
-v3 yenilikleri:
-- Binance topLongShortPositionRatio eklendi (pozisyon buyuklugu = "para nerede")
-- Account vs Position AYRISMA paneli (whale long/retail short tespiti)
-- Ayri Binance grafigi (account vs position 2 cizgi)
-- Ana grafige Binance position cizgisi (kesik)
-- TR + UTC saat ve tarih gosterimi
+v4 yenilikleri:
+- Binance ban korumasi (418/429 yerel takip, max 30dk, otomatik toparlanma)
+- TTL cache (90s) - tum borsa cagrilari; yenilemeler ve cift cagrilar bedava
+- premiumIndex tek cagri (OI markPrice + funding birlesti)
+- Gecici hatalarda 1 retry (5xx + ag hatasi)
+- Divergence paneline "son veri: HH:MM TR (canli mum)" etiketi
+- OKX periyot fallback (15m/30m->5m, 4h->1H) + kartta not
 
-Calistirma:
-python3 app.py
+v3: position ratio, ayrisma paneli, Binance grafigi, TR+UTC saat
+Calistirma: python3 app.py
 """
 
 import http.server
@@ -20,18 +21,85 @@ import urllib.error
 import json
 import os
 import sys
+import time
+import threading
 from concurrent.futures import ThreadPoolExecutor
 
 PORT = int(os.environ.get("PORT", 8765))
 HOST = "0.0.0.0"
-USER_AGENT = "Mozilla/5.0 LSRatioTerminal/3.0"
+USER_AGENT = "Mozilla/5.0 LSRatioTerminal/4.0"
+
+# ===== Binance yerel ban takibi (K1) =====
+# 418/429 yenirse Binance'e gitmeyi keser; ustune istek yagdirip bani uzatmaz.
+_ban_until = 0.0
+_BAN_MAX_SECONDS = 1800  # en fazla 30dk
+
+def _binance_banned():
+    return time.time() < _ban_until
+
+def _set_binance_ban(secs):
+    global _ban_until
+    secs = min(max(int(secs), 10), _BAN_MAX_SECONDS)
+    until = time.time() + secs
+    if until > _ban_until:
+        _ban_until = until
+
+# ===== TTL cache (K2) =====
+_cache = {}
+_cache_lock = threading.Lock()
+CACHE_TTL = 90  # saniye - 5dk yenileme + elle FETCH tekrarlarini bedavaya getirir
 
 
-def http_get(url, timeout=10):
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        raw = resp.read()
-        return json.loads(raw)
+def http_get(url, timeout=10, retries=1):
+    """Ham istek. Binance banliysa hic gitmez; 418/429'da ban koyar;
+    5xx ve ag hatalarinda 1 kez tekrar dener (K4)."""
+    is_binance = "fapi.binance.com" in url
+    if is_binance and _binance_banned():
+        raise RuntimeError("Binance gecici banli (yerel takip), istek atlandi")
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read())
+        except urllib.error.HTTPError as e:
+            if is_binance and e.code in (418, 429):
+                ra = 0
+                try:
+                    ra = int(e.headers.get("Retry-After") or 0)
+                except Exception:
+                    pass
+                _set_binance_ban(ra if ra > 0 else (300 if e.code == 418 else 60))
+                raise
+            if e.code >= 500 and attempt < retries:
+                time.sleep(0.5)
+                continue
+            raise
+        except Exception:
+            if attempt < retries:
+                time.sleep(0.5)
+                continue
+            raise
+
+
+def http_get_cached(url, timeout=10, ttl=CACHE_TTL):
+    """TTL'li cache. Taze varsa istek atmaz. Istek basarisiz olursa ve eski
+    cache varsa onu doner (izleme araci - eski veri hicten iyidir)."""
+    now = time.time()
+    with _cache_lock:
+        ent = _cache.get(url)
+        if ent and now < ent[0]:
+            return ent[1]
+    try:
+        data = http_get(url, timeout=timeout)
+        with _cache_lock:
+            _cache[url] = (now + ttl, data)
+        return data
+    except Exception:
+        with _cache_lock:
+            ent = _cache.get(url)
+            if ent:
+                return ent[1]  # bayat ama mevcut
+        raise
 
 
 def safe(fn):
@@ -42,53 +110,64 @@ def safe(fn):
 
 
 # ============== BINANCE ==============
-def _binance_oi(sym):
+def _binance_metrics(sym):
+    """OI (USD) + funding TEK premiumIndex cagrisiyla (K3 - eskiden 2 kez cekiliyordu).
+    markPrice -> OI degerleme, lastFundingRate -> funding. Fallback'ler korundu."""
+    oi = None
+    fr = None
+    mark = None
+    prem = safe(lambda: http_get_cached(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}"))
+    if prem:
+        try:
+            v = prem.get("lastFundingRate")
+            if v not in (None, ""):
+                fr = float(v) * 100
+        except Exception:
+            pass
+        try:
+            m = float(prem.get("markPrice") or 0)
+            if m > 0:
+                mark = m
+        except Exception:
+            pass
+    # OI: miktar x fiyat (markPrice yoksa ticker fallback)
     try:
-        oi_j = http_get(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}")
+        oi_j = http_get_cached(f"https://fapi.binance.com/fapi/v1/openInterest?symbol={sym}")
         qty = float(oi_j.get("openInterest") or 0)
         if qty > 0:
+            price = mark
+            if not price:
+                tj = safe(lambda: http_get_cached(f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}"))
+                if tj:
+                    try:
+                        p = float(tj.get("price") or 0)
+                        if p > 0:
+                            price = p
+                    except Exception:
+                        pass
+            if price:
+                oi = qty * price
+    except Exception:
+        pass
+    # OI fallback: notional hist
+    if oi is None:
+        j = safe(lambda: http_get_cached(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period=5m&limit=1"))
+        if isinstance(j, list) and j:
             try:
-                pj = http_get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}")
-                price = float(pj.get("markPrice") or 0)
-                if price > 0:
-                    return qty * price
+                v = float(j[0].get("sumOpenInterestValue") or 0)
+                if v > 0:
+                    oi = v
             except Exception:
                 pass
+    # Funding fallback
+    if fr is None:
+        j = safe(lambda: http_get_cached(f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}&limit=1"))
+        if isinstance(j, list) and j:
             try:
-                tj = http_get(f"https://fapi.binance.com/fapi/v1/ticker/price?symbol={sym}")
-                price = float(tj.get("price") or 0)
-                if price > 0:
-                    return qty * price
+                fr = float(j[0].get("fundingRate") or 0) * 100
             except Exception:
                 pass
-    except Exception:
-        pass
-    try:
-        j = http_get(f"https://fapi.binance.com/futures/data/openInterestHist?symbol={sym}&period=5m&limit=1")
-        if isinstance(j, list) and j:
-            v = float(j[0].get("sumOpenInterestValue") or 0)
-            if v > 0:
-                return v
-    except Exception:
-        pass
-    return None
-
-
-def _binance_funding(sym):
-    try:
-        j = http_get(f"https://fapi.binance.com/fapi/v1/premiumIndex?symbol={sym}")
-        fr = j.get("lastFundingRate")
-        if fr is not None and fr != "":
-            return float(fr) * 100
-    except Exception:
-        pass
-    try:
-        j = http_get(f"https://fapi.binance.com/fapi/v1/fundingRate?symbol={sym}&limit=1")
-        if isinstance(j, list) and j:
-            return float(j[0].get("fundingRate") or 0) * 100
-    except Exception:
-        pass
-    return None
+    return (oi, fr)
 
 
 def _binance_position(sym, period, limit):
@@ -99,7 +178,7 @@ def _binance_position(sym, period, limit):
     try:
         url = (f"https://fapi.binance.com/futures/data/topLongShortPositionRatio"
                f"?symbol={sym}&period={period}&limit={limit}")
-        data = http_get(url)
+        data = http_get_cached(url)
         if not isinstance(data, list) or len(data) == 0:
             return (None, [])
         series = [{"t": int(d["timestamp"]), "longPct": float(d["longAccount"]) * 100} for d in data]
@@ -115,17 +194,16 @@ def fetch_binance(symbol, period, limit):
     p = period_map.get(period, "1h")
     url = (f"https://fapi.binance.com/futures/data/globalLongShortAccountRatio"
            f"?symbol={sym}&period={p}&limit={limit}")
-    data = http_get(url)
+    data = http_get_cached(url)
     if not isinstance(data, list) or len(data) == 0:
         raise RuntimeError("NO DATA")
     series = [{"t": int(d["timestamp"]), "longPct": float(d["longAccount"]) * 100} for d in data]
     last = data[-1]
-    with ThreadPoolExecutor(max_workers=3) as ex:
-        f_oi = ex.submit(safe, lambda: _binance_oi(sym))
-        f_fr = ex.submit(safe, lambda: _binance_funding(sym))
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        f_m = ex.submit(safe, lambda: _binance_metrics(sym))
         f_pos = ex.submit(lambda: _binance_position(sym, p, limit))
-        oi_usd = f_oi.result()
-        funding = f_fr.result()
+        metrics = f_m.result()
+        oi_usd, funding = metrics if metrics else (None, None)
         pos_long, pos_series = f_pos.result()
 
     account_long = float(last["longAccount"]) * 100
@@ -152,7 +230,7 @@ def fetch_binance(symbol, period, limit):
 
 # ============== BYBIT ==============
 def _bybit_metrics(sym):
-    j = http_get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}")
+    j = http_get_cached(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={sym}")
     if j.get("retCode") != 0:
         return (None, None)
     lst = (j.get("result") or {}).get("list") or []
@@ -183,7 +261,7 @@ def fetch_bybit(symbol, period, limit):
     p = period_map.get(period, "1h")
     url = (f"https://api.bybit.com/v5/market/account-ratio"
            f"?category=linear&symbol={sym}&period={p}&limit={limit}")
-    j = http_get(url)
+    j = http_get_cached(url)
     if j.get("retCode") != 0:
         raise RuntimeError(j.get("retMsg") or "API ERROR")
     lst = (j.get("result") or {}).get("list") or []
@@ -207,20 +285,20 @@ def fetch_bybit(symbol, period, limit):
 def _okx_metrics(inst_id):
     oi = None; fr = None
     try:
-        j = http_get(f"https://www.okx.com/api/v5/public/open-interest?instId={inst_id}")
+        j = http_get_cached(f"https://www.okx.com/api/v5/public/open-interest?instId={inst_id}")
         if j.get("code") == "0" and j.get("data"):
             d = j["data"][0]
             if d.get("oiUsd"):
                 oi = float(d["oiUsd"])
             elif d.get("oiCcy"):
-                pj = http_get(f"https://www.okx.com/api/v5/market/ticker?instId={inst_id}")
+                pj = http_get_cached(f"https://www.okx.com/api/v5/market/ticker?instId={inst_id}")
                 if pj.get("code") == "0" and pj.get("data"):
                     price = float(pj["data"][0]["last"])
                     oi = float(d["oiCcy"]) * price
     except Exception:
         pass
     try:
-        j = http_get(f"https://www.okx.com/api/v5/public/funding-rate?instId={inst_id}")
+        j = http_get_cached(f"https://www.okx.com/api/v5/public/funding-rate?instId={inst_id}")
         if j.get("code") == "0" and j.get("data"):
             fr = float(j["data"][0]["fundingRate"]) * 100
     except Exception:
@@ -231,11 +309,19 @@ def _okx_metrics(inst_id):
 def fetch_okx(symbol, period, limit):
     ccy = symbol.upper().replace("USDT", "").replace("-USDT-SWAP", "")
     inst_id = f"{ccy}-USDT-SWAP"
-    period_map = {"5m":"5m","15m":"15m","30m":"30m","1h":"1H","4h":"4H","1d":"1D"}
-    p = period_map.get(period, "1H")
+    # OKX rubik endpoint'i SADECE 5m / 1H / 1D destekler (M3).
+    # Desteklenmeyen periyotlarda en yakina dus + ayni zaman penceresini korumak
+    # icin limit'i carparak iste (15m->5m: x3, 30m->5m: x6, 4h->1H: x4).
+    okx_map = {"5m": "5m", "15m": "5m", "30m": "5m", "1h": "1H", "4h": "1H", "1d": "1D"}
+    factor_map = {"15m": 3, "30m": 6, "4h": 4}
+    p = okx_map.get(period, "1H")
+    eff_limit = min(limit * factor_map.get(period, 1), 500)
+    period_note = None
+    if period in factor_map:
+        period_note = f"OKX {period} desteklemiyor - {p} verisi gosteriliyor"
     url = (f"https://www.okx.com/api/v5/rubik/stat/contracts/long-short-account-ratio"
-           f"?ccy={ccy}&period={p}&limit={limit}")
-    j = http_get(url)
+           f"?ccy={ccy}&period={p}&limit={eff_limit}")
+    j = http_get_cached(url)
     if j.get("code") != "0":
         raise RuntimeError(j.get("msg") or "API ERROR")
     arr = j.get("data") or []
@@ -255,6 +341,7 @@ def fetch_okx(symbol, period, limit):
         "ok": True, "longPct": long_pct, "shortPct": 100 - long_pct,
         "longShortRatio": last_ratio, "series": series,
         "openInterest": oi_usd, "fundingRate": funding,
+        "periodNote": period_note,
     }
 
 
@@ -262,13 +349,13 @@ def fetch_okx(symbol, period, limit):
 def _bitget_metrics(sym):
     oi = None; fr = None
     try:
-        j = http_get(f"https://api.bitget.com/api/v2/mix/market/open-interest?symbol={sym}&productType=USDT-FUTURES")
+        j = http_get_cached(f"https://api.bitget.com/api/v2/mix/market/open-interest?symbol={sym}&productType=USDT-FUTURES")
         if j.get("code") == "00000":
             data = j.get("data") or {}
             ol = data.get("openInterestList") or []
             if ol:
                 qty = float(ol[0].get("size") or 0)
-                tj = http_get(f"https://api.bitget.com/api/v2/mix/market/ticker?symbol={sym}&productType=USDT-FUTURES")
+                tj = http_get_cached(f"https://api.bitget.com/api/v2/mix/market/ticker?symbol={sym}&productType=USDT-FUTURES")
                 if tj.get("code") == "00000" and tj.get("data"):
                     tdata = tj["data"]
                     if isinstance(tdata, list) and tdata:
@@ -278,7 +365,7 @@ def _bitget_metrics(sym):
     except Exception:
         pass
     try:
-        j = http_get(f"https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol={sym}&productType=USDT-FUTURES")
+        j = http_get_cached(f"https://api.bitget.com/api/v2/mix/market/current-fund-rate?symbol={sym}&productType=USDT-FUTURES")
         if j.get("code") == "00000":
             data = j.get("data") or []
             if isinstance(data, list) and data:
@@ -296,7 +383,7 @@ def fetch_bitget(symbol, period, limit):
     p = period_map.get(period, "1h")
     url = (f"https://api.bitget.com/api/v2/mix/market/account-long-short"
            f"?symbol={sym}&period={p}&productType=USDT-FUTURES&limit={limit}")
-    j = http_get(url)
+    j = http_get_cached(url)
     if j.get("code") != "00000":
         raise RuntimeError(j.get("msg") or "API ERROR")
     arr = j.get("data") or []
@@ -641,6 +728,16 @@ const acc = binance.longPct;
 const pos = binance.positionLongPct;
 const fr = fmtFunding(binance.fundingRate);
 
+// M1: son veri noktasi zamani (TR) - bu deger CANLI (olusan) muma ait,
+// Engine/Hyblock kapanmis mum kullanir; kiyaslarken fark normaldir.
+let lastTxt = '';
+if (binance.series && binance.series.length) {
+const lt = binance.series[binance.series.length - 1].t;
+const ld = new Date(lt + 3*3600*1000);
+const z = n => String(n).padStart(2, '0');
+lastTxt = `<div style="margin-top:10px;font-size:10px;color:var(--text-faint)">son veri: ${z(ld.getUTCDate())}.${z(ld.getUTCMonth()+1)} ${z(ld.getUTCHours())}:${z(ld.getUTCMinutes())} TR (canli mum)</div>`;
+}
+
 // Position yoksa: account goster, position bos
 if (pos == null) {
 body.innerHTML = `
@@ -658,7 +755,7 @@ body.innerHTML = `
 <div class="dv-summary">
 <div class="dv-diff">FUNDING: <b class="${fr.cls}" style="font-size:13px">${fr.text}</b></div>
 <div class="dv-tag aligned">POSITION VERISI YOK</div>
-</div>`;
+</div>${lastTxt}`;
 return;
 }
 
@@ -693,7 +790,7 @@ body.innerHTML = `
 <div class="dv-diff">AYRISMA: <b class="${diff>0?'lng':'sht'}" style="color:${diff>0?'var(--green)':'var(--red)'}">${diffSign}${diff.toFixed(1)}%</b>
 <span style="color:var(--text-dim);margin-left:10px">FUNDING: <span class="${fr.cls}">${fr.text}</span></span></div>
 <div class="dv-tag ${level}">${dirTxt} &middot; ${levelTxt}</div>
-</div>`;
+</div>${lastTxt}`;
 }
 
 function renderCards(results) {
@@ -724,6 +821,7 @@ ${posRow}
 <div class="divider"></div>
 <div class="ratio-row"><span class="l">OPEN INTEREST</span><span class="v">${oi}</span></div>
 <div class="ratio-row"><span class="l">FUNDING RATE</span><span class="v ${fr.cls}">${fr.text}</span></div>
+${r.periodNote ? `<div class="err-msg" style="color:var(--amber);opacity:0.85">${r.periodNote}</div>` : ''}
 `;
 } else {
 const msg = r?.error || 'NO DATA';
@@ -1061,7 +1159,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Ratio Terminal v3 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Ratio Terminal v4 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), LSHandler) as srv:
             srv.serve_forever()
