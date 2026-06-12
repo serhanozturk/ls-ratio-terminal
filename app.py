@@ -1,5 +1,5 @@
 """
-L/S RATIO TERMINAL - Cloud-Ready Server (v4)
+L/S RATIO TERMINAL - Cloud-Ready Server (v4.1)
 =============================================
 v4 yenilikleri:
 - Binance ban korumasi (418/429 yerel takip, max 30dk, otomatik toparlanma)
@@ -31,15 +31,19 @@ USER_AGENT = "Mozilla/5.0 LSRatioTerminal/4.0"
 
 # ===== Binance yerel ban takibi (K1) =====
 # 418/429 yenirse Binance'e gitmeyi keser; ustune istek yagdirip bani uzatmaz.
+# v4.1: Retry-After header'i VARSA tamamina uyulur (30dk cap YOK) - uzun banlarda
+# 30dk'da bir yoklamak Binance tarafinda bani uzatiyordu. Header yoksa eski davranis.
 _ban_until = 0.0
-_BAN_MAX_SECONDS = 1800  # en fazla 30dk
+_BAN_DEFAULT_MAX = 1800    # header YOKSA varsayilan ust sinir (30dk)
+_BAN_HEADER_MAX = 86400    # header VARSA bile mantikli ust sinir (1 gun, sacma degerlere karsi)
 
 def _binance_banned():
     return time.time() < _ban_until
 
-def _set_binance_ban(secs):
+def _set_binance_ban(secs, from_header=False):
     global _ban_until
-    secs = min(max(int(secs), 10), _BAN_MAX_SECONDS)
+    cap = _BAN_HEADER_MAX if from_header else _BAN_DEFAULT_MAX
+    secs = min(max(int(secs), 10), cap)
     until = time.time() + secs
     if until > _ban_until:
         _ban_until = until
@@ -68,7 +72,10 @@ def http_get(url, timeout=10, retries=1):
                     ra = int(e.headers.get("Retry-After") or 0)
                 except Exception:
                     pass
-                _set_binance_ban(ra if ra > 0 else (300 if e.code == 418 else 60))
+                if ra > 0:
+                    _set_binance_ban(ra, from_header=True)  # header'a TAM uy (v4.1)
+                else:
+                    _set_binance_ban(300 if e.code == 418 else 60)
                 raise
             if e.code >= 500 and attempt < retries:
                 time.sleep(0.5)
@@ -1159,7 +1166,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Ratio Terminal v4 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Ratio Terminal v4.1 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), LSHandler) as srv:
             srv.serve_forever()
