@@ -1,16 +1,22 @@
 """
-L/S RATIO TERMINAL - Cloud-Ready Server (v4.1)
+L/S RATIO TERMINAL - Cloud-Ready Server (v4.2)
 =============================================
+v4.2 (M2): account ve position ayrisma panelinde AYNI mumda hizalama.
+- Iki ayri Binance endpoint'inin son noktalari farkli saate denk gelebilirdi
+  -> ayrisma yaniltici oluyordu. Artik ortak en son mumda hizalanir.
+- Hizalanamazsa (ortak mum yok) '⚠ uyumsuz saat'; 2 periyottan eskiyse '⚠ BAYAT';
+  olusan mumsa 'canli mum', degilse 'kapanmis mum' etiketi.
+
 v4 yenilikleri:
 - Binance ban korumasi (418/429 yerel takip, max 30dk, otomatik toparlanma)
 - TTL cache (90s) - tum borsa cagrilari; yenilemeler ve cift cagrilar bedava
 - premiumIndex tek cagri (OI markPrice + funding birlesti)
 - Gecici hatalarda 1 retry (5xx + ag hatasi)
-- Divergence paneline "son veri: HH:MM TR (canli mum)" etiketi
+- Divergence paneli hizalanmis mum etiketi (v4.2)
 - OKX periyot fallback (15m/30m->5m, 4h->1H) + kartta not
 
 v3: position ratio, ayrisma paneli, Binance grafigi, TR+UTC saat
-Calistirma: python3 app.py
+Calistirma: python3 lst_app.py
 """
 
 import http.server
@@ -195,6 +201,54 @@ def _binance_position(sym, period, limit):
         return (None, [])
 
 
+# ===== M2: account/position ayni mumda hizalama + tazelik =====
+_PERIOD_MS = {"5m": 300000, "15m": 900000, "30m": 1800000,
+              "1h": 3600000, "4h": 14400000, "1d": 86400000}
+
+
+def _align_account_position(acc_series, pos_series, period,
+                            acc_last, pos_last, acc_last_t):
+    """account ve position serilerini AYNI mumda hizala.
+    Iki ayri Binance endpoint'i; son noktalari farkli saate denk gelebilir,
+    hizasiz cikarma yaniltici ayrisma uretir.
+    Donus: (acc_pct, pos_pct|None, last_ts_ms, aligned_bool)
+      - position yoksa            -> (acc_last, None, acc_last_t, True)  account-only
+      - ortak mum varsa           -> o mumun acc/pos degeri, aligned=True
+      - ortak mum yoksa           -> bagimsiz [-1]'ler, aligned=False (uyari ile gosterilir)
+    Zaman damgalari periyot kovasina yuvarlanir (ayni grid icin guvence)."""
+    if not pos_series or pos_last is None:
+        return (acc_last, None, acc_last_t, True)
+    step = _PERIOD_MS.get(period, 3600000)
+
+    def bucket(t):
+        return int(t) - (int(t) % step)
+
+    acc_by_t = {}
+    for p in acc_series:
+        acc_by_t[bucket(p["t"])] = p["longPct"]
+    pos_by_t = {}
+    for p in pos_series:
+        pos_by_t[bucket(p["t"])] = p["longPct"]
+    common = sorted(set(acc_by_t) & set(pos_by_t))
+    if common:
+        t = common[-1]
+        return (acc_by_t[t], pos_by_t[t], t, True)
+    # ortak mum yok: hizasiz, bagimsiz son noktalar (UI uyari rozetiyle gosterir)
+    return (acc_last, pos_last, acc_last_t, False)
+
+
+def _freshness(last_ts, period, now_ms):
+    """Hizalanmis mumun tazeligi. (forming, stale):
+      forming = su an olusan (canli) mum   -> yas < 1 periyot
+      stale   = 2 periyottan eski (bayat)  -> yas > 2 periyot
+    Aradaki (son kapanmis mum) ikisi de False."""
+    if not last_ts:
+        return (False, False)
+    step = _PERIOD_MS.get(period, 3600000)
+    age = now_ms - last_ts
+    return (age < step, age > step * 2)
+
+
 def fetch_binance(symbol, period, limit):
     sym = symbol.upper().replace("USDT", "") + "USDT"
     period_map = {"5m":"5m","15m":"15m","30m":"30m","1h":"1h","4h":"4h","1d":"1d"}
@@ -205,7 +259,8 @@ def fetch_binance(symbol, period, limit):
     if not isinstance(data, list) or len(data) == 0:
         raise RuntimeError("NO DATA")
     series = [{"t": int(d["timestamp"]), "longPct": float(d["longAccount"]) * 100} for d in data]
-    last = data[-1]
+    acc_last_t = series[-1]["t"]
+    acc_last_long = float(data[-1]["longAccount"]) * 100
     with ThreadPoolExecutor(max_workers=2) as ex:
         f_m = ex.submit(safe, lambda: _binance_metrics(sym))
         f_pos = ex.submit(lambda: _binance_position(sym, p, limit))
@@ -213,25 +268,44 @@ def fetch_binance(symbol, period, limit):
         oi_usd, funding = metrics if metrics else (None, None)
         pos_long, pos_series = f_pos.result()
 
-    account_long = float(last["longAccount"]) * 100
+    # M2: account ve position'i AYNI mumda hizala (bagimsiz [-1]'ler farkli saatte olabilir)
+    acc, pos_aligned, last_ts, aligned = _align_account_position(
+        series, pos_series, p, acc_last_long, pos_long, acc_last_t)
+
     # Ayrisma: position - account (pozitif = para hesaplardan daha long = whale long/retail short)
     divergence = None
-    if pos_long is not None:
-        divergence = pos_long - account_long
+    if pos_aligned is not None:
+        divergence = pos_aligned - acc
+
+    # Account karti da hizalanmis muma gore (longShortRatio = long%/short%, tam)
+    short_pct = 100 - acc
+    lsr = (acc / short_pct) if short_pct > 0 else None
+
+    # Tazelik: yalniz hizali ise anlamli (hizasizda UI '⚠ uyumsuz saat' gosterir)
+    now_ms = int(time.time() * 1000)
+    forming, stale = _freshness(last_ts, p, now_ms) if aligned else (False, False)
+    pos_last_t = pos_series[-1]["t"] if pos_series else None
 
     return {
         "ok": True,
-        "longPct": account_long,
-        "shortPct": float(last["shortAccount"]) * 100,
-        "longShortRatio": float(last["longShortRatio"]),
+        "longPct": acc,
+        "shortPct": short_pct,
+        "longShortRatio": lsr,
         "series": series,
         "openInterest": oi_usd,
         "fundingRate": funding,
-        # YENI: position (pozisyon buyuklugu) + ayrisma
-        "positionLongPct": pos_long,
-        "positionShortPct": (100 - pos_long) if pos_long is not None else None,
+        # position (pozisyon buyuklugu) + ayrisma
+        "positionLongPct": pos_aligned,
+        "positionShortPct": (100 - pos_aligned) if pos_aligned is not None else None,
         "positionSeries": pos_series,
         "divergence": divergence,
+        # M2: hizalama + tazelik
+        "lastTs": last_ts,     # hizalanmis mumun zamani (ms)
+        "aligned": aligned,    # account+position ayni mumda mi
+        "forming": forming,    # hizali mum su an olusan (canli) mu
+        "stale": stale,        # 2 periyottan eski mi (bayat)
+        "accTs": acc_last_t,   # teshis: account son noktasi
+        "posTs": pos_last_t,   # teshis: position son noktasi
     }
 
 
@@ -567,6 +641,9 @@ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap;
 .dv-tag.aligned { color:var(--text-dim); border-color:var(--border-strong); }
 .dv-tag.strong { box-shadow:0 0 12px currentColor; }
 .dv-none { color:var(--text-faint); font-size:11px; padding:8px 0; }
+.dv-fresh-warn { color:var(--red); font-weight:700; }
+.dv-fresh-live { color:var(--green); }
+.dv-fresh-dim { color:var(--text-dim); }
 .info { margin-top:32px; padding:16px; background:var(--bg-2);
 border:1px dashed var(--border-strong); font-size:11px; color:var(--text-dim); line-height:1.7; }
 .info b { color:var(--text); }
@@ -735,14 +812,18 @@ const acc = binance.longPct;
 const pos = binance.positionLongPct;
 const fr = fmtFunding(binance.fundingRate);
 
-// M1: son veri noktasi zamani (TR) - bu deger CANLI (olusan) muma ait,
-// Engine/Hyblock kapanmis mum kullanir; kiyaslarken fark normaldir.
+// M2: hizalanmis mum zamani (TR). account ve position AYNI mumdan alinir.
+// Hizasizsa '⚠ uyumsuz saat'; bayatsa '⚠ BAYAT'; olusan mumsa 'canli mum'.
 let lastTxt = '';
-if (binance.series && binance.series.length) {
-const lt = binance.series[binance.series.length - 1].t;
-const ld = new Date(lt + 3*3600*1000);
+if (binance.lastTs) {
+const ld = new Date(binance.lastTs + 3*3600*1000);
 const z = n => String(n).padStart(2, '0');
-lastTxt = `<div style="margin-top:10px;font-size:10px;color:var(--text-faint)">son veri: ${z(ld.getUTCDate())}.${z(ld.getUTCMonth()+1)} ${z(ld.getUTCHours())}:${z(ld.getUTCMinutes())} TR (canli mum)</div>`;
+let tag, cls;
+if (binance.aligned === false) { tag = '⚠ uyumsuz saat'; cls = 'dv-fresh-warn'; }
+else if (binance.stale) { tag = '⚠ BAYAT'; cls = 'dv-fresh-warn'; }
+else if (binance.forming) { tag = 'canli mum'; cls = 'dv-fresh-live'; }
+else { tag = 'kapanmis mum'; cls = 'dv-fresh-dim'; }
+lastTxt = `<div style="margin-top:10px;font-size:10px;color:var(--text-faint)">son veri: ${z(ld.getUTCDate())}.${z(ld.getUTCMonth()+1)} ${z(ld.getUTCHours())}:${z(ld.getUTCMinutes())} TR <span class="${cls}">(${tag})</span></div>`;
 }
 
 // Position yoksa: account goster, position bos
@@ -1166,7 +1247,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Ratio Terminal v4.1 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Ratio Terminal v4.2 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), LSHandler) as srv:
             srv.serve_forever()
