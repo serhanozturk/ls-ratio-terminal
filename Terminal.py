@@ -1095,6 +1095,7 @@ function themeColors() {
 
 function makeChart(ctx, datasets, cutoff, now, period) {
 const TC = themeColors();
+return new Chart(ctx, {
 type: 'line', data: { datasets },
 plugins: [crosshairPlugin],
 options: {
