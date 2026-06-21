@@ -1,5 +1,10 @@
 """
-L/S RATIO TERMINAL - Cloud-Ready Server (v4.2)
+L/S RATIO TERMINAL - Cloud-Ready Server (v4.3)
+
+v4.3: Gece/gunduz modu eklendi (Screener ile ayni sistem). Tema butonu (header),
+  localStorage'da saklanir (lst_theme), varsayilan KOYU. CSS degiskenleri ile
+  acik/koyu palet; grafikler (Chart.js) tema-duyarli (themeColors helper, CSS
+  degiskeninden okur). Sadece arayuz - Binance/veri mantigi DEGISMEDI, ban riski YOK.
 =============================================
 v4.2 (M2): account ve position ayrisma panelinde AYNI mumda hizalama.
 - Iki ayri Binance endpoint'inin son noktalari farkli saate denk gelebilirdi
@@ -516,6 +521,18 @@ DASHBOARD_HTML = '''<!DOCTYPE html>
 --accent: #6df5d4; --amber: #ffb83d;
 --binance: #f3ba2f; --bybit: #ff4d6d; --okx: #ffffff; --bitget: #6df5d4;
 }
+body.light {
+--bg: #f4f6f5; --bg-2: #ffffff;
+--border: #dde3e1; --border-strong: #c4cecb;
+--text: #1a2422; --text-dim: #6e7976; --text-faint: #a8b2af;
+--green: #00a37a; --red: #e0334f; --red-dim: #c42d44;
+--accent: #0a9b7d; --amber: #d4920f;
+--binance: #c99617; --bybit: #e0334f; --okx: #1a2422; --bitget: #0a9b7d;
+}
+body.light::before { background: radial-gradient(ellipse at top left, rgba(0,163,122,0.05), transparent 50%),
+radial-gradient(ellipse at bottom right, rgba(224,51,79,0.04), transparent 50%); }
+body.light::after { background-image: linear-gradient(rgba(0,0,0,0.025) 1px, transparent 1px),
+linear-gradient(90deg, rgba(0,0,0,0.025) 1px, transparent 1px); }
 * { box-sizing: border-box; margin: 0; padding: 0; -webkit-tap-highlight-color: transparent; }
 html, body { background: var(--bg); color: var(--text);
 font-family: 'JetBrains Mono', monospace; font-size: 13px;
@@ -539,6 +556,10 @@ gap:16px; flex-wrap:wrap; }
 letter-spacing:0.04em; color:var(--text); }
 .logo span { color: var(--green); }
 .meta { display:flex; gap:20px; align-items:center; font-size:11px; color:var(--text-dim); }
+.theme-btn { background:transparent; border:1px solid var(--border-strong); color:var(--text);
+border-radius:6px; width:30px; height:30px; cursor:pointer; font-size:14px; line-height:1;
+display:flex; align-items:center; justify-content:center; transition:border-color 0.2s; }
+.theme-btn:hover { border-color:var(--text-dim); }
 .meta .clocks { display:flex; flex-direction:column; gap:2px; text-align:right; }
 .meta .dot { width:6px; height:6px; border-radius:50%; background:var(--green);
 display:inline-block; margin-right:6px; box-shadow:0 0 6px var(--green);
@@ -673,6 +694,7 @@ input[type="text"], select { font-size:16px; }
 <header>
 <div class="logo">L/S<span>&middot;</span>RATIO<span>&middot;</span>TERMINAL</div>
 <div class="meta">
+<button class="theme-btn" id="themeBtn" title="Tema">&#9789;</button>
 <span><span class="dot"></span>LIVE</span>
 <div class="clocks">
 <span id="clockTR">--.-- --:--:-- TR</span>
@@ -1055,8 +1077,24 @@ ctx.restore();
 }
 };
 
+function themeColors() {
+  // Aktif temadan (CSS degiskenlerinden) grafik renklerini oku
+  const cs = getComputedStyle(document.body);
+  const v = (n, fb) => (cs.getPropertyValue(n).trim() || fb);
+  const light = document.body.classList.contains('light');
+  return {
+    text:   v('--text', '#d4dcd9'),
+    dim:    v('--text-dim', '#6e7976'),
+    faint:  v('--text-faint', '#3f4845'),
+    border: v('--border', '#1f2a28'),
+    grid:   light ? 'rgba(0,0,0,0.06)' : '#14201d',
+    bg:     v('--bg', '#0a0e0d'),
+    strong: v('--border-strong', '#2a3a37'),
+  };
+}
+
 function makeChart(ctx, datasets, cutoff, now, period) {
-return new Chart(ctx, {
+const TC = themeColors();
 type: 'line', data: { datasets },
 plugins: [crosshairPlugin],
 options: {
@@ -1065,8 +1103,8 @@ interaction: { mode: 'index', intersect: false },
 plugins: {
 legend: { display: false },
 tooltip: {
-backgroundColor: '#0a0e0d', borderColor: '#2a3a37', borderWidth: 1,
-titleColor: '#d4dcd9', bodyColor: '#d4dcd9',
+backgroundColor: TC.bg, borderColor: TC.strong, borderWidth: 1,
+titleColor: TC.text, bodyColor: TC.text,
 titleFont: { family: 'JetBrains Mono', size: 11 }, bodyFont: { family: 'JetBrains Mono', size: 11 },
 padding: 10, caretPadding: 12,
 // Tooltip'i SABIT konuma tasi (noktayi kapatmasin) - hep ust ortada
@@ -1089,21 +1127,21 @@ x: { type: 'time', min: cutoff, max: now,
 // sonra callback'te +3 ile temiz TR gosterilir (cift kaydirma olmaz)
 adapters: { date: { zone: 'UTC' } },
 time: { displayFormats: { minute:'HH:mm', hour:'MM/dd HH:mm', day:'MM/dd' } },
-grid: { color:'#14201d', drawTicks:false },
-ticks: { color:'#6e7976', font:{ family:'JetBrains Mono', size:10 }, maxTicksLimit: 6,
+grid: { color:TC.grid, drawTicks:false },
+ticks: { color:TC.dim, font:{ family:'JetBrains Mono', size:10 }, maxTicksLimit: 6,
 // Eksen etiketleri TR saati (timestamp + 3 saat). Tarayici diliminden bagimsiz.
 callback: function(value) {
 const tr = new Date(value + 3*3600*1000);
 const z = n => String(n).padStart(2,'0');
 return `${z(tr.getUTCMonth()+1)}/${z(tr.getUTCDate())} ${z(tr.getUTCHours())}:${z(tr.getUTCMinutes())}`;
 } },
-title: { display: true, text: 'TR (UTC+3)', color:'#3f4845',
+title: { display: true, text: 'TR (UTC+3)', color:TC.faint,
 font:{ family:'JetBrains Mono', size:9 }, padding:{top:4} },
-border: { color:'#1f2a28' } },
+border: { color:TC.border } },
 y: { min:0, max:100,
-grid: { color:'#14201d', drawTicks:false },
-ticks: { color:'#6e7976', font:{ family:'JetBrains Mono', size:10 }, callback: (v) => v + '%' },
-border: { color:'#1f2a28' } },
+grid: { color:TC.grid, drawTicks:false },
+ticks: { color:TC.dim, font:{ family:'JetBrains Mono', size:10 }, callback: (v) => v + '%' },
+border: { color:TC.border } },
 },
 },
 });
@@ -1167,6 +1205,25 @@ document.getElementById('clockTR').textContent =
 `${z(tr.getUTCDate())}.${z(tr.getUTCMonth()+1)}.${tr.getUTCFullYear()} ${z(tr.getUTCHours())}:${z(tr.getUTCMinutes())}:${z(tr.getUTCSeconds())} TR`;
 }
 setInterval(tick, 1000); tick();
+
+// ===== Gece/gunduz modu (Screener ile ayni sistem) =====
+function applyTheme(light) {
+  document.body.classList.toggle('light', light);
+  document.getElementById('themeBtn').innerHTML = light ? '\u2600' : '\u263D';
+  document.querySelector('meta[name=theme-color]').setAttribute('content', light ? '#f4f6f5' : '#0a0e0d');
+  try { localStorage.setItem('lst_theme', light ? 'light' : 'dark'); } catch {}
+  // Tema degisince grafikleri yeniden ciz (renkler CSS degiskenlerinden gelir)
+  if (lastFetch) {
+    try {
+      renderChart(lastFetch.results, lastFetch.period, lastFetch.limit);
+      renderBinanceChart(lastFetch.results, lastFetch.period, lastFetch.limit);
+    } catch (e) {}
+  }
+}
+document.getElementById('themeBtn').addEventListener('click', () => {
+  applyTheme(!document.body.classList.contains('light'));
+});
+(function(){ let l=false; try{ l=localStorage.getItem('lst_theme')==='light'; }catch{}; applyTheme(l); })();
 
 setInterval(() => { if (!document.hidden && lastFetch) run(); }, 300000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden && lastFetch) run(); });
@@ -1247,7 +1304,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Ratio Terminal v4.2 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Ratio Terminal v4.3 listening on {HOST}:{PORT}", flush=True)
     try:
         with ThreadedServer((HOST, PORT), LSHandler) as srv:
             srv.serve_forever()
