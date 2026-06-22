@@ -703,6 +703,11 @@ input[type="text"], select { font-size:16px; }
 </div>
 </header>
 
+<div style="display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px">
+<a href="/" style="display:block;padding:9px 16px;font-size:11px;letter-spacing:0.08em;text-decoration:none;color:var(--green);border-bottom:2px solid var(--green);margin-bottom:-1px;font-weight:700">L/S TERMINAL</a>
+<a href="/whale" style="display:block;padding:9px 16px;font-size:11px;letter-spacing:0.08em;text-decoration:none;color:var(--text-dim);border-bottom:2px solid transparent;margin-bottom:-1px">&#x1F40B; WHALE</a>
+</div>
+
 <div class="controls">
 <div class="input-group">
 <label>SEMBOL / SYMBOL</label>
@@ -1275,6 +1280,27 @@ class LSHandler(http.server.BaseHTTPRequestHandler):
             self._send(200, "application/json; charset=utf-8", MANIFEST_JSON.encode("utf-8")); return
         if path == "/healthz":
             self._send_json(200, {"ok": True}); return
+        if path.startswith("/api/whale/"):
+            # whale route'lari; FETCHERS'a girmemeli
+            sub = path[len("/api/whale/"):].strip("/").lower()
+            if sub == "wallets":
+                with _w_lock:
+                    rows = [{"addr": k[0], "coin": k[1], "side": k[2],
+                             "total": v["total"], "last_ts": v["last_ts"]}
+                            for k, v in _w_wallets.items()]
+                self._send_json(200, {"ok": True, "wallets": rows}); return
+            if sub == "trades":
+                with _w_lock:
+                    trades = list(_w_recent)
+                self._send_json(200, {"ok": True, "trades": trades}); return
+            if sub == "stats":
+                self._send_json(200, {
+                    "ok": True, "polls": _w_stats["polls"],
+                    "errors": _w_stats["errors"],
+                    "uptime": int(time.time() - _w_stats["start"]),
+                    "wallets": len(_w_wallets), "recent": len(_w_recent),
+                }); return
+            self._send_json(404, {"ok": False, "error": "not found"}); return
         if path.startswith("/api/"):
             ex = path[len("/api/"):].strip("/").lower()
             if ex not in FETCHERS:
@@ -1296,7 +1322,369 @@ class LSHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json(200, {"ok": False, "error": str(e)})
             return
+        if path == "/whale":
+            self._send_html(WHALE_HTML); return
         self._send_json(404, {"ok": False, "error": "not found"})
+
+
+# ======================================================================
+# WHALE TRACKER — Hyperliquid buyuk pozisyon takibi (Terminal eklentisi)
+# Tamamen bagimsiz: Binance/borsa koduna SIFIR etki.
+# Hyperliquid public REST, API key yok, ban riski yok.
+# ======================================================================
+
+_W_COINS         = ["BTC", "ETH"]
+_W_SINGLE_MIN    = 500_000      # tek islem bildirimi esigi (USD)
+_W_CUMUL_STEP    = 1_000_000    # kumulatif adim (her 1M USD)
+_W_MEGA          = 5_000_000    # MEGA esigi
+_W_POLL_INTERVAL = 15           # saniye
+_W_HL_URL        = "https://api.hyperliquid.xyz/info"
+
+_w_lock     = threading.Lock()
+_w_seen     = set()       # islenmis trade id'leri
+_w_recent   = []          # son 100 buyuk islem
+_w_wallets  = {}          # {(addr,coin,side): {"total":float,"notified_at":float,"last_ts":int}}
+_w_stats    = {"polls": 0, "errors": 0, "start": time.time()}
+
+
+def _w_hl_post(payload):
+    data = json.dumps(payload).encode()
+    req = urllib.request.Request(
+        _W_HL_URL, data=data,
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "LSTerminal-WhaleTracker/1.0"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        _w_stats["errors"] += 1
+        return None
+
+
+def _w_fmt_usd(v):
+    if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
+    if v >= 1_000:     return f"{v/1_000:.0f}K"
+    return f"{v:.0f}"
+
+
+def _w_process(t):
+    coin = t.get("coin", "")
+    if coin not in _W_COINS:
+        return
+    tid = t.get("tid")
+    if tid is None:
+        return
+    with _w_lock:
+        if tid in _w_seen:
+            return
+        _w_seen.add(tid)
+        if len(_w_seen) > 100_000:
+            _w_seen.clear()
+            _w_seen.add(tid)
+    try:
+        px   = float(t.get("px", 0))
+        sz   = float(t.get("sz", 0))
+        side = t.get("side", "")
+        users = t.get("users", [])
+        ts   = int(t.get("time", time.time() * 1000))
+    except Exception:
+        return
+    usd = px * sz
+    if usd < 1000:
+        return
+    if side == "B" and isinstance(users, list) and len(users) > 0:
+        wallet = users[0] or ""
+    elif side == "A" and isinstance(users, list) and len(users) > 1:
+        wallet = users[1] or ""
+    else:
+        wallet = ""
+    rec = {"tid": tid, "coin": coin, "side": side,
+           "px": px, "sz": sz, "usd": usd, "addr": wallet, "ts": ts}
+    if usd >= _W_SINGLE_MIN:
+        with _w_lock:
+            _w_recent.insert(0, rec)
+            if len(_w_recent) > 100:
+                _w_recent.pop()
+    if not wallet:
+        return
+    key      = (wallet, coin, side)
+    ters_key = (wallet, coin, "A" if side == "B" else "B")
+    notify   = False
+    is_mega  = False
+    total    = 0.0
+    with _w_lock:
+        if ters_key in _w_wallets:
+            del _w_wallets[ters_key]
+        if key not in _w_wallets:
+            _w_wallets[key] = {"total": 0.0, "notified_at": 0.0, "last_ts": ts}
+        _w_wallets[key]["total"]   += usd
+        _w_wallets[key]["last_ts"]  = ts
+        total   = _w_wallets[key]["total"]
+        steps_now      = int(total // _W_CUMUL_STEP)
+        steps_notified = int(_w_wallets[key]["notified_at"] // _W_CUMUL_STEP) if _w_wallets[key]["notified_at"] > 0 else 0
+        if steps_now > steps_notified and total >= _W_CUMUL_STEP:
+            _w_wallets[key]["notified_at"] = total
+            is_mega = total >= _W_MEGA
+            notify  = True
+    # Telegram buraya eklenecek (v2)
+
+
+def _w_poll_loop():
+    while True:
+        for coin in _W_COINS:
+            try:
+                trades = _w_hl_post({"type": "recentTrades", "coin": coin})
+                if isinstance(trades, list):
+                    for t in trades:
+                        _w_process(t)
+                    _w_stats["polls"] += 1
+            except Exception:
+                _w_stats["errors"] += 1
+        time.sleep(_W_POLL_INTERVAL)
+
+
+WHALE_HTML = '''<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Whale Tracker</title>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap" rel="stylesheet">
+<style>
+:root{
+--bg:#0a0e0d;--bg2:#0f1413;--bg3:#131a19;
+--border:#1f2a28;--border2:#2a3a37;
+--text:#d4dcd9;--dim:#6e7976;--faint:#2a3837;
+--green:#00d09c;--red:#ff4d6d;--amber:#ffb83d;
+--accent:#6df5d4;--mega:#d45cff;
+--btc:#f7931a;--eth:#627eea;
+}
+body.light{
+--bg:#f4f6f5;--bg2:#ffffff;--bg3:#eef0ef;
+--border:#dde3e1;--border2:#c4cecb;
+--text:#1a2422;--dim:#6e7976;--faint:#dde3e1;
+--green:#00a37a;--red:#e0334f;--amber:#d4920f;
+--accent:#0a9b7d;--mega:#8800cc;
+--btc:#c0520a;--eth:#3a5bbb;
+}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
+html,body{background:var(--bg);color:var(--text);font-family:"JetBrains Mono",monospace;
+font-size:13px;line-height:1.5;min-height:100vh;-webkit-font-smoothing:antialiased;
+transition:background .25s,color .25s}
+.wrap{max-width:1100px;margin:0 auto;padding:20px;
+padding-top:calc(20px + env(safe-area-inset-top));
+padding-bottom:calc(60px + env(safe-area-inset-bottom))}
+/* NAV */
+.nav{display:flex;gap:0;margin-bottom:20px;border-bottom:1px solid var(--border)}
+.nav a{display:block;padding:10px 18px;font-size:11px;letter-spacing:0.08em;
+text-decoration:none;color:var(--dim);border-bottom:2px solid transparent;margin-bottom:-1px}
+.nav a:hover{color:var(--text)}
+.nav a.active{color:var(--green);border-bottom-color:var(--green);font-weight:700}
+/* HEADER */
+header{display:flex;align-items:center;justify-content:space-between;
+padding-bottom:16px;border-bottom:1px solid var(--border);margin-bottom:20px;gap:12px;flex-wrap:wrap}
+.logo{font-family:"JetBrains Mono",monospace;font-size:15px;font-weight:700;letter-spacing:0.06em}
+.logo .wh{color:var(--accent)}
+.header-right{display:flex;gap:10px;align-items:center}
+.clocks{font-size:10px;color:var(--dim);text-align:right;line-height:1.7}
+.theme-btn{background:transparent;border:1px solid var(--border2);color:var(--text);
+font-size:15px;width:34px;height:34px;cursor:pointer}
+.theme-btn:hover{border-color:var(--text)}
+/* STATS */
+.stats{display:flex;border:1px solid var(--border);margin-bottom:20px}
+.stat{flex:1;padding:10px 14px;border-right:1px solid var(--border)}
+.stat:last-child{border-right:none}
+.stat-lbl{font-size:9px;color:var(--dim);letter-spacing:0.1em;text-transform:uppercase;margin-bottom:3px}
+.stat-val{font-size:15px;font-weight:700}
+.stat-val.g{color:var(--green)}.stat-val.r{color:var(--red)}.stat-val.a{color:var(--amber)}
+/* STATUS */
+.status{font-size:10px;color:var(--dim);margin-bottom:14px;display:flex;align-items:center;gap:6px}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--green);
+animation:blink 2s infinite;flex-shrink:0}
+.dot.err{background:var(--red);animation:none}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+/* SEC TITLE */
+.sec{font-size:10px;color:var(--dim);letter-spacing:0.1em;text-transform:uppercase;
+margin-bottom:10px;padding-bottom:6px;border-bottom:1px solid var(--border);
+display:flex;align-items:center;justify-content:space-between}
+.sec span{color:var(--text)}
+.refresh-btn{background:transparent;border:1px solid var(--border2);color:var(--dim);
+font-family:inherit;font-size:10px;padding:5px 10px;cursor:pointer;letter-spacing:0.04em}
+.refresh-btn:hover{border-color:var(--green);color:var(--green)}
+/* WALLETS TABLE */
+.tbl-wrap{overflow-x:auto;margin-bottom:28px}
+table{width:100%;border-collapse:collapse;font-size:11px;min-width:560px}
+thead th{padding:7px 10px;text-align:left;color:var(--dim);font-size:9px;
+letter-spacing:0.1em;text-transform:uppercase;border-bottom:1px solid var(--border);font-weight:400}
+thead th.r{text-align:right}
+tbody td{padding:8px 10px;border-bottom:1px solid var(--border)}
+tbody td.r{text-align:right}
+tbody tr:hover{background:var(--bg2)}
+.cb{display:inline-block;padding:1px 6px;font-weight:700;font-size:10px;letter-spacing:0.04em}
+.cb.BTC{background:var(--btc);color:#000}.cb.ETH{background:var(--eth);color:#fff}
+.sl{color:var(--green);font-weight:700}.ss{color:var(--red);font-weight:700}
+.addr{font-size:10px;color:var(--dim);word-break:break-all}
+.uv{font-weight:700}
+.bar-w{width:72px;height:3px;background:var(--faint);display:inline-block;vertical-align:middle;margin-left:6px}
+.bar-f{height:3px;background:var(--accent)}
+.mega-b{background:var(--mega);color:#fff;font-size:9px;padding:1px 5px;font-weight:700;margin-left:4px}
+.empty{text-align:center;padding:24px 0;color:var(--dim)}
+/* TRADES */
+.trade{display:flex;align-items:flex-start;gap:10px;padding:8px 0;
+border-bottom:1px solid var(--border);flex-wrap:wrap}
+.trade:last-child{border-bottom:none}
+.tr-s{width:76px;flex-shrink:0;font-weight:700;font-size:11px}
+.tr-s.l{color:var(--green)}.tr-s.s{color:var(--red)}
+.tr-u{font-weight:700;font-size:13px;min-width:86px}
+.tr-d{font-size:10px;color:var(--dim);flex:1;min-width:130px}
+.tr-a{font-size:9px;color:var(--faint);word-break:break-all;width:100%}
+.tr-t{font-size:10px;color:var(--dim);min-width:56px;text-align:right;flex-shrink:0}
+.pulse{animation:pls .8s ease-out}
+@keyframes pls{from{background:var(--bg3)}to{background:transparent}}
+@media(max-width:600px){
+.stats{flex-wrap:wrap}.stat{min-width:50%}
+.nav a{padding:8px 12px}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+<header>
+  <div class="logo">L/S TERMINAL &mdash; <span class="wh">&#x1F40B; WHALE</span></div>
+  <div class="header-right">
+    <div class="clocks"><div id="cTR">-- TR</div><div id="cUTC">-- UTC</div></div>
+    <button class="theme-btn" id="themeBtn">&#9790;</button>
+  </div>
+</header>
+<nav class="nav">
+  <a href="/">L/S TERMINAL</a>
+  <a href="/whale" class="active">&#x1F40B; WHALE</a>
+</nav>
+<div class="stats">
+  <div class="stat"><div class="stat-lbl">Izlenen</div><div class="stat-val">BTC &amp; ETH</div></div>
+  <div class="stat"><div class="stat-lbl">Buyuk Islem</div><div class="stat-val g" id="sBig">0</div></div>
+  <div class="stat"><div class="stat-lbl">Aktif Cuzdan</div><div class="stat-val a" id="sWal">0</div></div>
+  <div class="stat"><div class="stat-lbl">Hata</div><div class="stat-val r" id="sErr">0</div></div>
+</div>
+<div class="status"><div class="dot" id="dot"></div><span id="statusTxt">Baglaniyor...</span></div>
+<div class="sec">AKTIF CUZDAN POZISYONLARI <span id="wCnt"></span>
+  <button class="refresh-btn" onclick="load()">&#8635; YENILE</button>
+</div>
+<div class="tbl-wrap">
+<table>
+  <thead><tr>
+    <th>CUZDAN</th><th>COIN</th><th>YON</th>
+    <th class="r">KUMULATIF</th><th class="r">ILERLEME</th>
+  </tr></thead>
+  <tbody id="wBody"><tr><td colspan="5" class="empty">Bekleniyor...</td></tr></tbody>
+</table>
+</div>
+<div class="sec">SON BUYUK ISLEMLER (&ge;500K USD) <span id="tCnt"></span></div>
+<div id="tradeList"><div class="empty">Bekleniyor...</div></div>
+</div>
+<script>
+var THEME_KEY = "lst_theme";
+function applyTheme(t){
+  document.body.className = t==="light"?"light":"";
+  document.getElementById("themeBtn").innerHTML = t==="light"?"&#9790;":"&#9728;";
+}
+(function(){applyTheme(localStorage.getItem(THEME_KEY)||"dark");})();
+document.getElementById("themeBtn").onclick=function(){
+  var t=document.body.classList.contains("light")?"dark":"light";
+  localStorage.setItem(THEME_KEY,t);applyTheme(t);
+};
+function pad(n){return n<10?"0"+n:n}
+function tick(){
+  var now=new Date();
+  var trMs=now.getTime()+now.getTimezoneOffset()*60000+3*3600000;
+  var tr=new Date(trMs);
+  document.getElementById("cTR").textContent=pad(tr.getUTCHours())+":"+pad(tr.getUTCMinutes())+":"+pad(tr.getUTCSeconds())+" TR";
+  document.getElementById("cUTC").textContent=pad(now.getUTCHours())+":"+pad(now.getUTCMinutes())+":"+pad(now.getUTCSeconds())+" UTC";
+}
+setInterval(tick,1000);tick();
+function fmtUSD(v){
+  if(v>=1e6)return(v/1e6).toFixed(2)+"M";
+  if(v>=1e3)return(v/1e3).toFixed(0)+"K";
+  return v.toFixed(0);
+}
+function fmtTime(ms){
+  var d=new Date(ms+3*3600000);
+  return pad(d.getUTCHours())+":"+pad(d.getUTCMinutes())+":"+pad(d.getUTCSeconds());
+}
+function renderWallets(ws){
+  document.getElementById("sWal").textContent=ws.length;
+  document.getElementById("wCnt").textContent=ws.length?"("+ws.length+")":"";
+  var tb=document.getElementById("wBody");
+  if(!ws.length){tb.innerHTML='<tr><td colspan="5" class="empty">Henuz kumulatif pozisyon yok</td></tr>';return;}
+  ws.sort(function(a,b){return b.total-a.total;});
+  tb.innerHTML=ws.map(function(w){
+    var sl=w.side==="B"?'<span class="sl">LONG</span>':'<span class="ss">SHORT</span>';
+    var pct=Math.min(w.total/_W_MEGA*100,100);
+    var mega=w.total>=_W_MEGA?'<span class="mega-b">MEGA</span>':"";
+    var bar='<div class="bar-w"><div class="bar-f" style="width:'+pct+'%"></div></div>';
+    return '<tr><td><span class="addr">'+w.addr+'</span></td>'+
+      '<td><span class="cb '+w.coin+'">'+w.coin+'</span></td>'+
+      '<td>'+sl+'</td>'+
+      '<td class="r"><span class="uv">'+fmtUSD(w.total)+'</span></td>'+
+      '<td class="r">'+Math.floor(w.total/1e6)+'M / 5M '+mega+bar+'</td></tr>';
+  }).join("");
+}
+function renderTrades(ts){
+  document.getElementById("sBig").textContent=ts.length;
+  document.getElementById("tCnt").textContent=ts.length?"("+ts.length+")":"";
+  var el=document.getElementById("tradeList");
+  if(!ts.length){el.innerHTML='<div class="empty">Henuz buyuk islem yok (&ge;500K USD)</div>';return;}
+  el.innerHTML=ts.map(function(t,i){
+    var isL=t.side==="B";
+    var sc=t.coin==="BTC"?"color:var(--btc)":"color:var(--eth)";
+    return '<div class="trade" id="tr'+i+'">'+
+      '<div class="tr-s '+(isL?"l":"s")+'"><span style="'+sc+'">'+t.coin+'</span> '+(isL?"LONG":"SHORT")+'</div>'+
+      '<div class="tr-u">'+fmtUSD(t.usd)+' USD</div>'+
+      '<div class="tr-d">'+t.sz+' '+t.coin+' @ '+Number(t.px).toLocaleString("en-US",{minimumFractionDigits:2,maximumFractionDigits:2})+'</div>'+
+      '<div class="tr-t">'+fmtTime(t.ts)+'</div>'+
+      '<div class="tr-a">'+t.addr+'</div>'+
+      '</div>';
+  }).join("");
+}
+var _W_MEGA=5000000;
+var lastBig=0;
+async function load(){
+  try{
+    var r=await Promise.all([
+      fetch("/api/whale/wallets").then(function(r){return r.json();}),
+      fetch("/api/whale/trades").then(function(r){return r.json();}),
+      fetch("/api/whale/stats").then(function(r){return r.json();})
+    ]);
+    var dW=r[0],dT=r[1],dS=r[2];
+    if(dW.ok)renderWallets(dW.wallets);
+    if(dT.ok){
+      if(dT.trades.length>lastBig){
+        renderTrades(dT.trades);
+        var first=document.querySelector(".trade");
+        if(first)first.classList.add("pulse");
+        lastBig=dT.trades.length;
+      } else renderTrades(dT.trades);
+    }
+    if(dS.ok){
+      document.getElementById("sErr").textContent=dS.errors;
+      document.getElementById("dot").className="dot";
+      document.getElementById("statusTxt").textContent=
+        "Canli \u2014 "+_W_COINS.join(", ")+" \u2014 Poll: "+dS.polls+" \u2014 Son guncelleme: "+new Date().toLocaleTimeString("tr-TR");
+    }
+  }catch(e){
+    document.getElementById("dot").className="dot err";
+    document.getElementById("statusTxt").textContent="Baglanti hatasi: "+e.message;
+  }
+}
+var _W_COINS=["BTC","ETH"];
+load();
+setInterval(load,15000);
+</script>
+</body>
+</html>
+'''
 
 
 class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
@@ -1306,6 +1694,9 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     print(f"L/S Ratio Terminal v4.3 listening on {HOST}:{PORT}", flush=True)
+    t = threading.Thread(target=_w_poll_loop, daemon=True)
+    t.start()
+    print("[whale] Hyperliquid polling basliyor (BTC+ETH, 15s)", flush=True)
     try:
         with ThreadedServer((HOST, PORT), LSHandler) as srv:
             srv.serve_forever()
