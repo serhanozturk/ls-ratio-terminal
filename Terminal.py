@@ -1295,7 +1295,7 @@ class LSHandler(http.server.BaseHTTPRequestHandler):
                 self._send_json(200, {"ok": True, "trades": trades}); return
             if sub == "stats":
                 self._send_json(200, {
-                    "ok": True, "polls": _w_stats["polls"],
+                    "ok": True, "msgs": _w_stats["msgs"],
                     "errors": _w_stats["errors"],
                     "uptime": int(time.time() - _w_stats["start"]),
                     "wallets": len(_w_wallets), "recent": len(_w_recent),
@@ -1333,40 +1333,138 @@ class LSHandler(http.server.BaseHTTPRequestHandler):
 # Hyperliquid public REST, API key yok, ban riski yok.
 # ======================================================================
 
-_W_COINS         = ["BTC", "ETH"]
-_W_SINGLE_MIN    = 500_000      # tek islem bildirimi esigi (USD)
-_W_CUMUL_STEP    = 1_000_000    # kumulatif adim (her 1M USD)
-_W_MEGA          = 5_000_000    # MEGA esigi
-_W_POLL_INTERVAL = 15           # saniye
-_W_HL_URL        = "https://api.hyperliquid.xyz/info"
+_W_COINS      = ["BTC", "ETH"]
+_W_SINGLE_MIN = 500_000    # tek islem esigi (USD)
+_W_CUMUL_STEP = 1_000_000  # kumulatif adim
+_W_MEGA       = 5_000_000  # MEGA esigi
+_W_WS_HOST    = "api.hyperliquid.xyz"
+_W_WS_PATH    = "/ws"
+_W_RECONNECT  = 5          # saniye, baglanti kopunca bekle
 
-_w_lock     = threading.Lock()
-_w_seen     = set()       # islenmis trade id'leri
-_w_recent   = []          # son 100 buyuk islem
-_w_wallets  = {}          # {(addr,coin,side): {"total":float,"notified_at":float,"last_ts":int}}
-_w_stats    = {"polls": 0, "errors": 0, "start": time.time()}
-
-
-def _w_hl_post(payload):
-    data = json.dumps(payload).encode()
-    req = urllib.request.Request(
-        _W_HL_URL, data=data,
-        headers={"Content-Type": "application/json",
-                 "User-Agent": "LSTerminal-WhaleTracker/1.0"},
-        method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as r:
-            return json.loads(r.read().decode())
-    except Exception:
-        _w_stats["errors"] += 1
-        return None
+_w_lock    = threading.Lock()
+_w_seen    = set()
+_w_recent  = []
+_w_wallets = {}
+_w_stats   = {"msgs": 0, "errors": 0, "reconnects": 0, "start": time.time(),
+              "status": "basliyor"}
 
 
 def _w_fmt_usd(v):
     if v >= 1_000_000: return f"{v/1_000_000:.2f}M"
     if v >= 1_000:     return f"{v/1_000:.0f}K"
     return f"{v:.0f}"
+
+
+# ---- Saf stdlib WebSocket client (RFC 6455 minimal) ----
+import socket as _socket, ssl as _ssl, base64 as _b64, struct as _struct, os as _os
+
+def _ws_handshake(sock, host, path):
+    key = _b64.b64encode(_os.urandom(16)).decode()
+    req = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {host}\r\n"
+        f"Upgrade: websocket\r\n"
+        f"Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        f"Sec-WebSocket-Version: 13\r\n\r\n"
+    )
+    sock.sendall(req.encode())
+    resp = b""
+    while b"\r\n\r\n" not in resp:
+        chunk = sock.recv(4096)
+        if not chunk:
+            raise ConnectionError("WS handshake bos yanit")
+        resp += chunk
+    if b"101" not in resp:
+        raise ConnectionError(f"WS handshake basarisiz: {resp[:120]}")
+
+
+def _ws_recv_frame(sock):
+    def _read_exact(n):
+        buf = b""
+        while len(buf) < n:
+            chunk = sock.recv(n - len(buf))
+            if not chunk:
+                raise ConnectionError("WS baglanti kapandi")
+            buf += chunk
+        return buf
+    header = _read_exact(2)
+    opcode = header[0] & 0x0F
+    masked = (header[1] & 0x80) != 0
+    length = header[1] & 0x7F
+    if length == 126:
+        length = _struct.unpack("!H", _read_exact(2))[0]
+    elif length == 127:
+        length = _struct.unpack("!Q", _read_exact(8))[0]
+    mask_key = _read_exact(4) if masked else b""
+    payload  = _read_exact(length)
+    if masked:
+        payload = bytes(b ^ mask_key[i % 4] for i, b in enumerate(payload))
+    if opcode == 0x9:  # Ping -> Pong
+        try: sock.sendall(bytes([0x8A, len(payload)]) + payload)
+        except Exception: pass
+        return None
+    if opcode == 0x8:  # Close
+        raise ConnectionError("WS sunucu kapatti")
+    if opcode in (0x1, 0x0):  # Text / continuation
+        return payload
+    return None
+
+
+def _ws_send(sock, text):
+    payload = text.encode()
+    n = len(payload)
+    mask = _os.urandom(4)
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    if n <= 125:
+        hdr = bytes([0x81, 0x80 | n])
+    elif n <= 65535:
+        hdr = bytes([0x81, 0xFE]) + _struct.pack("!H", n)
+    else:
+        hdr = bytes([0x81, 0xFF]) + _struct.pack("!Q", n)
+    sock.sendall(hdr + mask + masked)
+
+
+def _w_ws_loop(coin):
+    sub = json.dumps({"method": "subscribe",
+                      "subscription": {"type": "trades", "coin": coin}})
+    while True:
+        try:
+            raw = _socket.create_connection((_W_WS_HOST, 443), timeout=30)
+            ctx = _ssl.create_default_context()
+            sock = ctx.wrap_socket(raw, server_hostname=_W_WS_HOST)
+            sock.settimeout(60)
+            _ws_handshake(sock, _W_WS_HOST, _W_WS_PATH)
+            _ws_send(sock, sub)
+            with _w_lock:
+                _w_stats["status"] = "baglandi"
+            print(f"[whale] WS baglandi: {coin}", flush=True)
+            buf = b""
+            while True:
+                frame = _ws_recv_frame(sock)
+                if frame is None:
+                    continue
+                buf += frame
+                try:
+                    msg = json.loads(buf.decode())
+                    buf = b""
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                with _w_lock:
+                    _w_stats["msgs"] += 1
+                data = msg.get("data")
+                if isinstance(data, list):
+                    for t in data:
+                        _w_process(t)
+                elif isinstance(data, dict):
+                    _w_process(data)
+        except Exception as e:
+            with _w_lock:
+                _w_stats["errors"]     += 1
+                _w_stats["reconnects"] += 1
+                _w_stats["status"]      = f"yeniden ({e})"
+            print(f"[whale] WS hata ({coin}): {e} -- {_W_RECONNECT}s sonra yeniden", flush=True)
+            time.sleep(_W_RECONNECT)
 
 
 def _w_process(t):
@@ -1431,18 +1529,7 @@ def _w_process(t):
     # Telegram buraya eklenecek (v2)
 
 
-def _w_poll_loop():
-    while True:
-        for coin in _W_COINS:
-            try:
-                trades = _w_hl_post({"type": "recentTrades", "coin": coin})
-                if isinstance(trades, list):
-                    for t in trades:
-                        _w_process(t)
-                    _w_stats["polls"] += 1
-            except Exception:
-                _w_stats["errors"] += 1
-        time.sleep(_W_POLL_INTERVAL)
+
 
 
 WHALE_HTML = '''<!DOCTYPE html>
@@ -1671,7 +1758,7 @@ async function load(){
       document.getElementById("sErr").textContent=dS.errors;
       document.getElementById("dot").className="dot";
       document.getElementById("statusTxt").textContent=
-        "Canli \u2014 "+_W_COINS.join(", ")+" \u2014 Poll: "+dS.polls+" \u2014 Son guncelleme: "+new Date().toLocaleTimeString("tr-TR");
+        "WS Canli \u2014 "+_W_COINS.join(", ")+" \u2014 Mesaj: "+dS.msgs+" | Yeniden: "+dS.reconnects+" \u2014 "+new Date().toLocaleTimeString("tr-TR");
     }
   }catch(e){
     document.getElementById("dot").className="dot err";
@@ -1694,9 +1781,9 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 def main():
     print(f"L/S Ratio Terminal v4.3 listening on {HOST}:{PORT}", flush=True)
-    t = threading.Thread(target=_w_poll_loop, daemon=True)
-    t.start()
-    print("[whale] Hyperliquid polling basliyor (BTC+ETH, 15s)", flush=True)
+    for _coin in _W_COINS:
+        threading.Thread(target=_w_ws_loop, args=(_coin,), daemon=True).start()
+    print("[whale] WS stream basliyor (BTC+ETH) -- hic islem kacmaz", flush=True)
     try:
         with ThreadedServer((HOST, PORT), LSHandler) as srv:
             srv.serve_forever()
