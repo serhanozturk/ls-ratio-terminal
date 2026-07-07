@@ -1,6 +1,16 @@
 """
-L/S RATIO TERMINAL - Cloud-Ready Server (v4.3)
+L/S RATIO TERMINAL - Cloud-Ready Server (v4.4)
 
+v4.4: Whale Tracker duzeltmeleri:
+- Pasif taraf takibi: her trade'de ALICI + SATICI cuzdanlari islenir
+  (maker whale'ler artik kacmaz - kritik mantik duzeltmesi)
+- WS FIN biti takibi: bozuk mesaj buffer'i zehirlemez, akis olmez
+- Heartbeat: 30s sessizlikte ping (gereksiz reconnect biter)
+- Socket sizintisi kapatildi (finally'de close)
+- Cuzdan budama: >5000 kayitta 250K alti + 6h eski silinir; API sadece >=250K doner
+- stats'a reconnects + status eklendi ("Yeniden: undefined" duzeldi)
+- MEGA WHALE (>=5M) ayri bolum, en ustte, mor vurgu
+=============================================
 v4.3: Gece/gunduz modu eklendi (Screener ile ayni sistem). Tema butonu (header),
   localStorage'da saklanir (lst_theme), varsayilan KOYU. CSS degiskenleri ile
   acik/koyu palet; grafikler (Chart.js) tema-duyarli (themeColors helper, CSS
@@ -1287,19 +1297,23 @@ class LSHandler(http.server.BaseHTTPRequestHandler):
                 with _w_lock:
                     rows = [{"addr": k[0], "coin": k[1], "side": k[2],
                              "total": v["total"], "last_ts": v["last_ts"]}
-                            for k, v in _w_wallets.items()]
+                            for k, v in _w_wallets.items()
+                            if v["total"] >= _W_WALLET_FLOOR]
                 self._send_json(200, {"ok": True, "wallets": rows}); return
             if sub == "trades":
                 with _w_lock:
                     trades = list(_w_recent)
                 self._send_json(200, {"ok": True, "trades": trades}); return
             if sub == "stats":
-                self._send_json(200, {
-                    "ok": True, "msgs": _w_stats["msgs"],
-                    "errors": _w_stats["errors"],
-                    "uptime": int(time.time() - _w_stats["start"]),
-                    "wallets": len(_w_wallets), "recent": len(_w_recent),
-                }); return
+                with _w_lock:
+                    self._send_json(200, {
+                        "ok": True, "msgs": _w_stats["msgs"],
+                        "errors": _w_stats["errors"],
+                        "reconnects": _w_stats["reconnects"],
+                        "status": _w_stats["status"],
+                        "uptime": int(time.time() - _w_stats["start"]),
+                        "wallets": len(_w_wallets), "recent": len(_w_recent),
+                    }); return
             self._send_json(404, {"ok": False, "error": "not found"}); return
         if path.startswith("/api/"):
             ex = path[len("/api/"):].strip("/").lower()
@@ -1380,6 +1394,8 @@ def _ws_handshake(sock, host, path):
 
 
 def _ws_recv_frame(sock):
+    """Bir frame oku. Donus: (payload|None, fin_bool).
+    payload None ise (ping/pong/diger) yoksay. FIN biti fragman takibi icin."""
     def _read_exact(n):
         buf = b""
         while len(buf) < n:
@@ -1389,6 +1405,7 @@ def _ws_recv_frame(sock):
             buf += chunk
         return buf
     header = _read_exact(2)
+    fin    = (header[0] & 0x80) != 0
     opcode = header[0] & 0x0F
     masked = (header[1] & 0x80) != 0
     length = header[1] & 0x7F
@@ -1403,12 +1420,12 @@ def _ws_recv_frame(sock):
     if opcode == 0x9:  # Ping -> Pong
         try: sock.sendall(bytes([0x8A, len(payload)]) + payload)
         except Exception: pass
-        return None
+        return (None, True)
     if opcode == 0x8:  # Close
         raise ConnectionError("WS sunucu kapatti")
     if opcode in (0x1, 0x0):  # Text / continuation
-        return payload
-    return None
+        return (payload, fin)
+    return (None, True)
 
 
 def _ws_send(sock, text):
@@ -1428,12 +1445,16 @@ def _ws_send(sock, text):
 def _w_ws_loop(coin):
     sub = json.dumps({"method": "subscribe",
                       "subscription": {"type": "trades", "coin": coin}})
+    ping = json.dumps({"method": "ping"})
     while True:
+        sock = None
         try:
             raw = _socket.create_connection((_W_WS_HOST, 443), timeout=30)
             ctx = _ssl.create_default_context()
             sock = ctx.wrap_socket(raw, server_hostname=_W_WS_HOST)
-            sock.settimeout(60)
+            # 30s recv timeout: sessizlikte heartbeat ping atmak icin
+            # (Hyperliquid ~60s sessiz baglantilari kapatir)
+            sock.settimeout(30)
             _ws_handshake(sock, _W_WS_HOST, _W_WS_PATH)
             _ws_send(sock, sub)
             with _w_lock:
@@ -1441,15 +1462,23 @@ def _w_ws_loop(coin):
             print(f"[whale] WS baglandi: {coin}", flush=True)
             buf = b""
             while True:
-                frame = _ws_recv_frame(sock)
-                if frame is None:
-                    continue
-                buf += frame
                 try:
-                    msg = json.loads(buf.decode())
-                    buf = b""
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                    payload, fin = _ws_recv_frame(sock)
+                except _socket.timeout:
+                    # sessiz donem: heartbeat gonder, baglantiyi canli tut
+                    _ws_send(sock, ping)
                     continue
+                if payload is None:
+                    continue
+                buf += payload
+                if not fin:
+                    continue  # fragman devam ediyor, mesaj tamamlanmadi
+                # mesaj TAMAM (FIN=1): parse et, basarili/basarisiz buf'i sifirla
+                raw_msg, buf = buf, b""
+                try:
+                    msg = json.loads(raw_msg.decode())
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue  # bozuk mesaj atildi; buffer temiz, akis devam
                 with _w_lock:
                     _w_stats["msgs"] += 1
                 data = msg.get("data")
@@ -1465,6 +1494,70 @@ def _w_ws_loop(coin):
                 _w_stats["status"]      = f"yeniden ({e})"
             print(f"[whale] WS hata ({coin}): {e} -- {_W_RECONNECT}s sonra yeniden", flush=True)
             time.sleep(_W_RECONNECT)
+        finally:
+            if sock is not None:
+                try: sock.close()
+                except Exception: pass
+
+
+# Budama esikleri: sozluk sismesin, UI bogulmasin
+_W_WALLET_FLOOR = 250_000   # bu altindaki cuzdanlar budanabilir + API'ye donmez
+_W_WALLET_MAX   = 5000      # sozlukteki maksimum kayit; asilirsa kucuk/eski silinir
+_w_prune_tick   = [0]       # islem sayaci (budamayi seyrek calistirmak icin)
+
+
+def _w_prune_locked():
+    """_w_lock TUTULURKEN cagrilir. Once esik alti + eski olanlari, gerekirse
+    en dusuk toplamlilari sil."""
+    if len(_w_wallets) <= _W_WALLET_MAX:
+        return
+    now_ms = int(time.time() * 1000)
+    # 1) esik alti VE 6 saattir islem gormemis kayitlari at
+    stale_cut = now_ms - 6 * 3600 * 1000
+    for k in [k for k, v in _w_wallets.items()
+              if v["total"] < _W_WALLET_FLOOR and v["last_ts"] < stale_cut]:
+        del _w_wallets[k]
+    # 2) hala fazlaysa: en dusuk toplamdan baslayarak sil (esik ustunu koru)
+    if len(_w_wallets) > _W_WALLET_MAX:
+        by_total = sorted(_w_wallets.items(), key=lambda kv: kv[1]["total"])
+        for k, v in by_total:
+            if len(_w_wallets) <= _W_WALLET_MAX:
+                break
+            if v["total"] >= _W_WALLET_FLOOR:
+                break  # esik ustune dokunma
+            del _w_wallets[k]
+
+
+def _w_track_wallet(wallet, coin, side, usd, ts):
+    """Bir cuzdanin bir yondeki birikimini guncelle.
+    side: bu cuzdan icin islem yonu (B=long birikim, A=short birikim).
+    Ters yon islem gelirse o cuzdanin ters sayaci sifirlanir."""
+    key      = (wallet, coin, side)
+    ters_key = (wallet, coin, "A" if side == "B" else "B")
+    notify   = False
+    is_mega  = False
+    total    = 0.0
+    with _w_lock:
+        if ters_key in _w_wallets:
+            del _w_wallets[ters_key]
+        if key not in _w_wallets:
+            _w_wallets[key] = {"total": 0.0, "notified_at": 0.0, "last_ts": ts}
+        _w_wallets[key]["total"]   += usd
+        _w_wallets[key]["last_ts"]  = ts
+        total   = _w_wallets[key]["total"]
+        steps_now      = int(total // _W_CUMUL_STEP)
+        steps_notified = int(_w_wallets[key]["notified_at"] // _W_CUMUL_STEP) if _w_wallets[key]["notified_at"] > 0 else 0
+        if steps_now > steps_notified and total >= _W_CUMUL_STEP:
+            _w_wallets[key]["notified_at"] = total
+            is_mega = total >= _W_MEGA
+            notify  = True
+        # seyrek budama (her 500 cagirimda bir)
+        _w_prune_tick[0] += 1
+        if _w_prune_tick[0] >= 500:
+            _w_prune_tick[0] = 0
+            _w_prune_locked()
+    # Telegram buraya eklenecek (v2): notify/is_mega/total kullanilacak
+    return notify, is_mega, total
 
 
 def _w_process(t):
@@ -1492,41 +1585,24 @@ def _w_process(t):
     usd = px * sz
     if usd < 1000:
         return
-    if side == "B" and isinstance(users, list) and len(users) > 0:
-        wallet = users[0] or ""
-    elif side == "A" and isinstance(users, list) and len(users) > 1:
-        wallet = users[1] or ""
-    else:
-        wallet = ""
+    # users = [alici, satici] (agresor kim olursa olsun her trade'de ikisi de var)
+    buyer  = users[0] if isinstance(users, list) and len(users) > 0 and users[0] else ""
+    seller = users[1] if isinstance(users, list) and len(users) > 1 and users[1] else ""
+    # Buyuk islem listesi: agresor tarafin cuzdaniyla goster
+    display_addr = buyer if side == "B" else seller
     rec = {"tid": tid, "coin": coin, "side": side,
-           "px": px, "sz": sz, "usd": usd, "addr": wallet, "ts": ts}
+           "px": px, "sz": sz, "usd": usd, "addr": display_addr, "ts": ts}
     if usd >= _W_SINGLE_MIN:
         with _w_lock:
             _w_recent.insert(0, rec)
             if len(_w_recent) > 100:
                 _w_recent.pop()
-    if not wallet:
-        return
-    key      = (wallet, coin, side)
-    ters_key = (wallet, coin, "A" if side == "B" else "B")
-    notify   = False
-    is_mega  = False
-    total    = 0.0
-    with _w_lock:
-        if ters_key in _w_wallets:
-            del _w_wallets[ters_key]
-        if key not in _w_wallets:
-            _w_wallets[key] = {"total": 0.0, "notified_at": 0.0, "last_ts": ts}
-        _w_wallets[key]["total"]   += usd
-        _w_wallets[key]["last_ts"]  = ts
-        total   = _w_wallets[key]["total"]
-        steps_now      = int(total // _W_CUMUL_STEP)
-        steps_notified = int(_w_wallets[key]["notified_at"] // _W_CUMUL_STEP) if _w_wallets[key]["notified_at"] > 0 else 0
-        if steps_now > steps_notified and total >= _W_CUMUL_STEP:
-            _w_wallets[key]["notified_at"] = total
-            is_mega = total >= _W_MEGA
-            notify  = True
-    # Telegram buraya eklenecek (v2)
+    # Kumulatif takip: HER IKI cuzdan da islenir (pasif/maker taraf kacmasin).
+    # Alici -> LONG birikimi (B), satici -> SHORT birikimi (A).
+    if buyer:
+        _w_track_wallet(buyer, coin, "B", usd, ts)
+    if seller:
+        _w_track_wallet(seller, coin, "A", usd, ts)
 
 
 
@@ -1656,9 +1732,20 @@ border-bottom:1px solid var(--border);flex-wrap:wrap}
   <div class="stat"><div class="stat-lbl">Hata</div><div class="stat-val r" id="sErr">0</div></div>
 </div>
 <div class="status"><div class="dot" id="dot"></div><span id="statusTxt">Baglaniyor...</span></div>
-<div class="sec">AKTIF CUZDAN POZISYONLARI <span id="wCnt"></span>
+<div class="sec" style="color:var(--mega)">&#x1F988; MEGA WHALE (&ge;5M USD) <span id="mCnt"></span>
   <button class="refresh-btn" onclick="load()">&#8635; YENILE</button>
 </div>
+<div class="tbl-wrap">
+<table>
+  <thead><tr>
+    <th>CUZDAN</th><th>COIN</th><th>YON</th>
+    <th class="r">KUMULATIF</th><th class="r">SEVIYE</th>
+  </tr></thead>
+  <tbody id="mBody"><tr><td colspan="5" class="empty">Henuz MEGA whale yok</td></tr></tbody>
+</table>
+</div>
+
+<div class="sec">AKTIF CUZDAN POZISYONLARI <span id="wCnt"></span></div>
 <div class="tbl-wrap">
 <table>
   <thead><tr>
@@ -1700,23 +1787,30 @@ function fmtTime(ms){
   var d=new Date(ms+3*3600000);
   return pad(d.getUTCHours())+":"+pad(d.getUTCMinutes())+":"+pad(d.getUTCSeconds());
 }
+function walletRow(w,isMega){
+  var sl=w.side==="B"?'<span class="sl">LONG</span>':'<span class="ss">SHORT</span>';
+  var pct=Math.min(w.total/_W_MEGA*100,100);
+  var bar='<div class="bar-w"><div class="bar-f" style="width:'+pct+'%'+(isMega?';background:var(--mega)':'')+'"></div></div>';
+  var lvl=isMega?'<span class="mega-b">'+Math.floor(w.total/1e6)+'M</span>':Math.floor(w.total/1e6)+'M / 5M';
+  return '<tr><td><span class="addr">'+w.addr+'</span></td>'+
+    '<td><span class="cb '+w.coin+'">'+w.coin+'</span></td>'+
+    '<td>'+sl+'</td>'+
+    '<td class="r"><span class="uv"'+(isMega?' style="color:var(--mega)"':'')+'>'+fmtUSD(w.total)+'</span></td>'+
+    '<td class="r">'+lvl+' '+bar+'</td></tr>';
+}
 function renderWallets(ws){
-  document.getElementById("sWal").textContent=ws.length;
-  document.getElementById("wCnt").textContent=ws.length?"("+ws.length+")":"";
-  var tb=document.getElementById("wBody");
-  if(!ws.length){tb.innerHTML='<tr><td colspan="5" class="empty">Henuz kumulatif pozisyon yok</td></tr>';return;}
   ws.sort(function(a,b){return b.total-a.total;});
-  tb.innerHTML=ws.map(function(w){
-    var sl=w.side==="B"?'<span class="sl">LONG</span>':'<span class="ss">SHORT</span>';
-    var pct=Math.min(w.total/_W_MEGA*100,100);
-    var mega=w.total>=_W_MEGA?'<span class="mega-b">MEGA</span>':"";
-    var bar='<div class="bar-w"><div class="bar-f" style="width:'+pct+'%"></div></div>';
-    return '<tr><td><span class="addr">'+w.addr+'</span></td>'+
-      '<td><span class="cb '+w.coin+'">'+w.coin+'</span></td>'+
-      '<td>'+sl+'</td>'+
-      '<td class="r"><span class="uv">'+fmtUSD(w.total)+'</span></td>'+
-      '<td class="r">'+Math.floor(w.total/1e6)+'M / 5M '+mega+bar+'</td></tr>';
-  }).join("");
+  var mega=ws.filter(function(w){return w.total>=_W_MEGA;});
+  var norm=ws.filter(function(w){return w.total<_W_MEGA;});
+  document.getElementById("sWal").textContent=ws.length;
+  document.getElementById("mCnt").textContent=mega.length?"("+mega.length+")":"";
+  document.getElementById("wCnt").textContent=norm.length?"("+norm.length+")":"";
+  var mb=document.getElementById("mBody");
+  mb.innerHTML=mega.length?mega.map(function(w){return walletRow(w,true);}).join(""):
+    '<tr><td colspan="5" class="empty">Henuz MEGA whale yok</td></tr>';
+  var tb=document.getElementById("wBody");
+  tb.innerHTML=norm.length?norm.map(function(w){return walletRow(w,false);}).join(""):
+    '<tr><td colspan="5" class="empty">Henuz kumulatif pozisyon yok</td></tr>';
 }
 function renderTrades(ts){
   document.getElementById("sBig").textContent=ts.length;
@@ -1780,7 +1874,7 @@ class ThreadedServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 
 
 def main():
-    print(f"L/S Ratio Terminal v4.3 listening on {HOST}:{PORT}", flush=True)
+    print(f"L/S Ratio Terminal v4.4 listening on {HOST}:{PORT}", flush=True)
     for _coin in _W_COINS:
         threading.Thread(target=_w_ws_loop, args=(_coin,), daemon=True).start()
     print("[whale] WS stream basliyor (BTC+ETH) -- hic islem kacmaz", flush=True)
